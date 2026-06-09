@@ -1,7 +1,12 @@
 """Exporta o MobileNetV3-Small como extrator de embeddings TFLite.
 
-Gera `mobilenet_v3_embedder.tflite` (entrada 224x224x3 float em [0,1],
+Gera `mobilenet_v3_embedder.tflite` (entrada 160x160x3 float em [0,1],
 saída: vetor de features do Global Average Pooling, ~576 dims).
+
+Entrada 160x160 (em vez de 224): ~2x mais rápida no Galaxy M31
+(Exynos 9611, XNNPACK em 4x A73) — necessário para acompanhar
+18.000 garrafas/h. O app lê o tamanho de entrada do próprio modelo,
+então basta trocar o .tflite para experimentar outros tamanhos.
 
 Uso:
     pip install tensorflow
@@ -11,7 +16,7 @@ Uso:
 
 import tensorflow as tf
 
-IMG_SIZE = 224
+IMG_SIZE = 160
 
 base = tf.keras.applications.MobileNetV3Small(
     input_shape=(IMG_SIZE, IMG_SIZE, 3),

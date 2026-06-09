@@ -13,43 +13,55 @@ import kotlin.math.sqrt
 
 /**
  * Extrai um vetor de features (embedding) da ROI usando MobileNetV3-Small
- * como "feature vector" (saída do Global Average Pooling, sem a cabeça de
- * classificação). Modelo exportado por tools/export_tflite_model.py.
+ * sem a cabeça de classificação (tools/export_tflite_model.py).
  *
- * O embedding é L2-normalizado na saída, o que torna a distância de cosseno
- * um simples produto escalar (ver AnomalyModel).
+ * Tuning para o Galaxy M31 (Exynos 9611):
+ *  - Padrão: XNNPACK na CPU com 4 threads — casa com os 4x Cortex-A73.
+ *    Para modelos pequenos, o delegate GPU no Mali-G72 MP3 perde para a
+ *    CPU (overhead de upload/dispatch domina); habilite useGpu apenas se
+ *    o benchmark no dispositivo final disser o contrário.
+ *  - Entrada 160x160 (definida na exportação): ~2x mais rápida que 224
+ *    com perda de acurácia irrelevante para anomalia em ROI fixa. O
+ *    tamanho é lido do próprio modelo — trocar o .tflite basta.
+ *  - Buffers reutilizados: zero alocação por inferência (sem pressão de
+ *    GC na thread de análise).
  */
-class FeatureExtractor(context: Context) : AutoCloseable {
+class FeatureExtractor(context: Context, useGpu: Boolean = false) : AutoCloseable {
 
     companion object {
         private const val MODEL_ASSET = "mobilenet_v3_embedder.tflite"
-        const val INPUT_SIZE = 224
     }
 
     private val interpreter: Interpreter
     private var gpuDelegate: GpuDelegate? = null
 
-    /** Buffer de entrada reutilizado: zero alocação por frame (evita GC na thread de análise). */
-    private val inputBuffer: ByteBuffer = ByteBuffer
-        .allocateDirect(INPUT_SIZE * INPUT_SIZE * 3 * 4)
-        .order(ByteOrder.nativeOrder())
-
-    private val pixels = IntArray(INPUT_SIZE * INPUT_SIZE)
-
+    val inputSize: Int
     val embeddingDim: Int
+
+    private val inputBuffer: ByteBuffer
+    private val pixels: IntArray
+    private val output: Array<FloatArray>
 
     init {
         val options = Interpreter.Options().apply {
             val compat = CompatibilityList()
-            if (compat.isDelegateSupportedOnThisDevice) {
+            if (useGpu && compat.isDelegateSupportedOnThisDevice) {
                 gpuDelegate = GpuDelegate(compat.bestOptionsForThisDevice)
                 addDelegate(gpuDelegate)
             } else {
-                numThreads = 4
+                numThreads = 4 // 4x A73; XNNPACK ativo por padrão no TFLite 2.x
             }
         }
         interpreter = Interpreter(loadModel(context), options)
+
+        inputSize = interpreter.getInputTensor(0).shape()[1] // [1, H, W, 3]
         embeddingDim = interpreter.getOutputTensor(0).shape().last()
+
+        inputBuffer = ByteBuffer
+            .allocateDirect(inputSize * inputSize * 3 * 4)
+            .order(ByteOrder.nativeOrder())
+        pixels = IntArray(inputSize * inputSize)
+        output = Array(1) { FloatArray(embeddingDim) }
     }
 
     private fun loadModel(context: Context): ByteBuffer {
@@ -61,13 +73,13 @@ class FeatureExtractor(context: Context) : AutoCloseable {
     }
 
     /**
-     * @param roiBitmap recorte da ROI já feito (qualquer tamanho; será
-     *        redimensionado para 224x224 aqui).
-     * @return embedding L2-normalizado.
+     * @param roiBitmap recorte da ROI (redimensionado para o input aqui).
+     * @return embedding L2-normalizado. O array retornado é uma CÓPIA —
+     *         seguro para guardar na baseline de calibração.
      */
     fun extract(roiBitmap: Bitmap): FloatArray {
-        val scaled = Bitmap.createScaledBitmap(roiBitmap, INPUT_SIZE, INPUT_SIZE, true)
-        scaled.getPixels(pixels, 0, INPUT_SIZE, 0, 0, INPUT_SIZE, INPUT_SIZE)
+        val scaled = Bitmap.createScaledBitmap(roiBitmap, inputSize, inputSize, true)
+        scaled.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
         if (scaled !== roiBitmap) scaled.recycle()
 
         inputBuffer.rewind()
@@ -78,11 +90,10 @@ class FeatureExtractor(context: Context) : AutoCloseable {
             inputBuffer.putFloat((pixel and 0xFF) / 255f)
         }
 
-        val output = Array(1) { FloatArray(embeddingDim) }
         inputBuffer.rewind()
         interpreter.run(inputBuffer, output)
 
-        return l2Normalize(output[0])
+        return l2Normalize(output[0]).copyOf()
     }
 
     private fun l2Normalize(v: FloatArray): FloatArray {

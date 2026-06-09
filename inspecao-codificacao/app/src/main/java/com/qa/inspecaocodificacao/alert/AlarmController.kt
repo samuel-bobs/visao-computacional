@@ -13,15 +13,22 @@ import kotlinx.coroutines.launch
 
 /**
  * Alarme industrial: apito contínuo (SoundPool, pré-carregado em memória
- * para latência ~zero) + flash LED piscando.
+ * para latência ~zero) + tela vermelha pulsante (na UI) e, opcionalmente,
+ * flash LED piscando.
  *
- * AUTO-RESET: quem chama stop() é a máquina de estados do item, na
- * transição SAINDO -> VAZIO (Estado D). A contagem de defeito já foi
- * registrada nesse momento, então parar o alarme não perde dados.
+ * NOTA 18k gph (torch desligado por padrão): a 5 garrafas/s, OUTRAS
+ * garrafas são inspecionadas DURANTE o alarme. O torch piscando muda a
+ * iluminação da ROI e contaminaria presença e anomaly score dessas
+ * garrafas — por isso useTorch=false no M31; o alerta visual é a tela.
+ *
+ * AUTO-RESET: a máquina por item registra o defeito na saída da ROI
+ * (Estado D); o ViewModel mantém o alarme por um tempo mínimo perceptível
+ * (alarmMinDurationMs) e então chama stop() — nenhum dado se perde.
  */
 class AlarmController(
     context: Context,
     private val scope: CoroutineScope,
+    private val useTorch: Boolean,
 ) {
 
     private val soundPool: SoundPool = SoundPool.Builder()
@@ -60,12 +67,14 @@ class AlarmController(
             activeStreamId = soundPool.play(alarmSoundId, 1f, 1f, 1, -1, 1f)
         }
 
-        torchJob = scope.launch {
-            var on = false
-            while (isActive) {
-                on = !on
-                runCatching { cameraControl?.enableTorch(on) }
-                delay(250L) // 2 Hz: bem visível no chão de fábrica
+        if (useTorch) {
+            torchJob = scope.launch {
+                var on = false
+                while (isActive) {
+                    on = !on
+                    runCatching { cameraControl?.enableTorch(on) }
+                    delay(250L) // 2 Hz: bem visível no chão de fábrica
+                }
             }
         }
     }
@@ -81,7 +90,9 @@ class AlarmController(
         }
         torchJob?.cancel()
         torchJob = null
-        runCatching { cameraControl?.enableTorch(false) }
+        if (useTorch) {
+            runCatching { cameraControl?.enableTorch(false) }
+        }
     }
 
     fun release() {

@@ -1,25 +1,52 @@
 package com.qa.inspecaocodificacao.camera
 
 import android.graphics.Bitmap
-import com.qa.inspecaocodificacao.domain.InspectionConfig
+import android.graphics.Rect
+import androidx.camera.core.ImageProxy
 
 /**
- * Recorta a Região de Interesse do frame.
+ * ESTÁGIO 2 (preparação): recorta a ROI direto do buffer RGBA para um
+ * Bitmap REUTILIZADO — sem converter o frame inteiro (proxy.toBitmap()
+ * faria 640x480 quando só precisamos de ~190x240) e sem alocar por frame.
  *
- * Como a câmera é FIXA, a ROI é definida uma única vez (frações do frame)
- * e vale para todos os frames. Processar só a ROI:
- *  - reduz o custo de inferência (224x224 cobre só a área útil);
- *  - elimina ruído do resto da cena (operadores passando ao fundo, etc.);
- *  - aumenta a sensibilidade, pois 100% dos pixels avaliados são relevantes.
+ * Como a ROI é fixa, o IntArray e o Bitmap são alocados uma única vez.
+ * Chamado apenas nos frames com garrafa presente (~15x/s a 18k gph),
+ * nunca nos frames vazios.
  */
-object RoiCropper {
+class RoiCropper {
 
-    fun crop(frame: Bitmap, config: InspectionConfig): Bitmap {
-        val left = (frame.width * config.roiLeft).toInt().coerceIn(0, frame.width - 2)
-        val top = (frame.height * config.roiTop).toInt().coerceIn(0, frame.height - 2)
-        val right = (frame.width * config.roiRight).toInt().coerceIn(left + 1, frame.width)
-        val bottom = (frame.height * config.roiBottom).toInt().coerceIn(top + 1, frame.height)
+    private var pixels: IntArray = IntArray(0)
+    private var bitmap: Bitmap? = null
 
-        return Bitmap.createBitmap(frame, left, top, right - left, bottom - top)
+    fun crop(proxy: ImageProxy, roi: Rect): Bitmap {
+        val w = roi.width()
+        val h = roi.height()
+
+        if (pixels.size != w * h) {
+            pixels = IntArray(w * h)
+            bitmap?.recycle()
+            bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        }
+        val out = bitmap!!
+
+        val plane = proxy.planes[0]
+        val buffer = plane.buffer
+        val rowStride = plane.rowStride
+        val pixelStride = plane.pixelStride
+
+        var idx = 0
+        for (y in 0 until h) {
+            var offset = (roi.top + y) * rowStride + roi.left * pixelStride
+            for (x in 0 until w) {
+                val r = buffer.get(offset).toInt() and 0xFF
+                val g = buffer.get(offset + 1).toInt() and 0xFF
+                val b = buffer.get(offset + 2).toInt() and 0xFF
+                pixels[idx++] = -0x1000000 or (r shl 16) or (g shl 8) or b
+                offset += pixelStride
+            }
+        }
+
+        out.setPixels(pixels, 0, w, 0, 0, w, h)
+        return out
     }
 }
