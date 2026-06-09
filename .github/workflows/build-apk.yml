@@ -1,0 +1,62 @@
+name: Build APK (inspecao-codificacao)
+
+on:
+  push:
+    branches: [claude/practical-cori-yjepos, main]
+    paths:
+      - "inspecao-codificacao/**"
+      - ".github/workflows/build-apk.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # TF 2.15 (Keras 2): o TFLiteConverter.from_keras_model do TF 2.16+
+      # tem incompatibilidades com Keras 3.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Gera o modelo TFLite (MobileNetV3-Small 160x160)
+        working-directory: inspecao-codificacao/tools
+        run: |
+          pip install --quiet tensorflow-cpu==2.15.1
+          python export_tflite_model.py
+          mkdir -p ../app/src/main/assets
+          cp mobilenet_v3_embedder.tflite ../app/src/main/assets/
+
+      - name: Compila o APK (debug)
+        working-directory: inspecao-codificacao
+        run: ./gradlew --no-daemon assembleDebug
+
+      - name: Renomeia o APK
+        run: cp inspecao-codificacao/app/build/outputs/apk/debug/app-debug.apk inspecao-codificacao-debug.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inspecao-codificacao-apk
+          path: inspecao-codificacao-debug.apk
+
+      - name: Publica release com o APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-build-${{ github.run_number }}
+          name: "APK Inspeção de Codificação — build ${{ github.run_number }}"
+          body: |
+            APK de depuração para instalação direta (sideload) no dispositivo piloto (Galaxy M31).
+
+            Instalação: baixe o `inspecao-codificacao-debug.apk` no celular, toque no arquivo
+            e autorize a instalação de fontes desconhecidas quando solicitado.
+          files: inspecao-codificacao-debug.apk
+          prerelease: true

@@ -61,6 +61,7 @@ print(f"NumPy version: {np.__version__}")
 2. reconhecimento-faces (use primeiro o `verifica_cameras.py`)
 3. deteccao-objetos
 4. rastreio-pessoas
+5. inspecao-codificacao (app Android de inspeção industrial com Edge AI — ver README do diretório)
 
 ## Desativação do Ambiente Virtual
 
