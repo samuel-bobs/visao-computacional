@@ -30,3 +30,9 @@ __pycache__/
 
 # Ignorar arquivos de configuração do Git
 .gitconfig
+
+# Android (inspecao-codificacao)
+inspecao-codificacao/**/build/
+inspecao-codificacao/.gradle/
+inspecao-codificacao/local.properties
+*.tflite
