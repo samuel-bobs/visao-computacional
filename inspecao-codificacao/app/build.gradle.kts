@@ -58,6 +58,7 @@ dependencies {
     // TensorFlow Lite (extração de features na borda)
     implementation("org.tensorflow:tensorflow-lite:2.14.0")
     implementation("org.tensorflow:tensorflow-lite-gpu:2.14.0")
+    implementation("org.tensorflow:tensorflow-lite-gpu-api:2.14.0")
 
     // Persistência das métricas do turno
     implementation("androidx.datastore:datastore-preferences:1.1.1")

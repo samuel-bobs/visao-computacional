@@ -75,8 +75,10 @@ class CalibrationSession(private val config: InspectionConfig) {
     }
 
     /** Presença na fase 2, usada para filtrar frames sem garrafa da baseline. */
-    fun presenceScore(grid: FloatArray): Float =
-        LumaGrid.diffScore(grid, backgroundGrid ?: return 0f)
+    fun presenceScore(grid: FloatArray): Float {
+        val background = backgroundGrid ?: return 0f
+        return LumaGrid.diffScore(grid, background)
+    }
 
     fun addProductEmbedding(embedding: FloatArray) {
         productEmbeddings.add(embedding)
