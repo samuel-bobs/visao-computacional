@@ -44,24 +44,58 @@ Ajustes específicos do **Galaxy M31** (Exynos 9611: 4×A73 + 4×A53, Mali-G72 M
 
 ## Fluxo de operação (máquina de estados do app)
 
+Treinamento em **duas etapas independentes** (revisão pós-teste de campo: a
+calibração monolítica de 60 s era inoperável com a linha rodando):
+
 ```
-IDLE ──"INICIAR CALIBRAÇÃO" + confirmação──> CALIBRANDO (60 s)
-                                                  │
-              ┌──── baseline salva ───────────────┘
-              v
-         MONITORANDO ──score > threshold (garrafa na ROI)──> ALARME
-              ^                                                 │
-              └── auto-reset: saída do item + retenção mínima ──┘
+IDLE ──"1·TREINAR FUNDO" (ROI vazia, ~13 s)──> TREINANDO FUNDO ──> IDLE (fundo ✓)
+IDLE ──"2·TREINAR PADRÃO" (produção, ~45 s)──> TREINANDO PADRÃO ──> MONITORANDO
+IDLE ──"MONITORAR"──> MONITORANDO <──auto-reset com retenção──> ALARME
+QA Admin ──"AJUSTAR ROI"──> ROI_SETUP (arrastar/redimensionar) ──> IDLE (retreino)
 ```
 
 | Estado | UI | Comportamento |
 |---|---|---|
-| `Idle` | Botão gigante azul + card de métricas | Pipeline ML desligado (economia de CPU) |
-| `Calibrating` | Barra de progresso + instrução por fase | Aprende fundo (10 s) e produto (50 s ≈ 250 garrafas) |
-| `Monitoring` | Faixa verde "MONITORANDO" + ROI amarela | Estágio 1 em todo frame, estágio 2 sob demanda |
+| `Idle` | 2 botões de treino + botão MONITORAR + status ✔/— | Estágio 1 segue alimentando o diagnóstico |
+| `CalibratingBackground` | Progresso "MANTENHA A ROI VAZIA" | Fundo + thresholds de presença (k-sigma) |
+| `CalibratingProduct` | Progresso + nº de amostras com garrafa | Centroide do produto + threshold de defeito |
+| `Monitoring` | Faixa verde + ROI amarela + botão PARAR | Estágio 1 em todo frame, estágio 2 sob demanda |
 | `Alarm` | Tela pulsando vermelho + apito | Retenção mínima de 2 s após a saída do item |
+| `RoiSetup` | ROI arrastável com alças nos cantos | Salvar invalida fundo+padrão (exige retreino) |
+
+Sem padrão treinado, "MONITORAR (só contagem)" opera apenas a contagem — útil
+para validar a contagem contra o contador da linha antes de treinar o padrão.
+
+Falhas de treino agora geram **mensagem visível** (antes o app voltava a IDLE
+em silêncio — causa raiz do "não contou nada" no teste de campo).
 
 Código: `domain/AppState.kt`, orquestração em `InspectionViewModel.kt`.
+
+## Ajustes de campo (QA Admin: toque longo no título)
+
+- **Ajustar janela de medição (ROI)**: arraste o meio para mover, os cantos
+  para redimensionar; persistida em DataStore. O preview agora é 4:3 com
+  escala FIT — a moldura na tela corresponde 1:1 ao recorte analisado
+  (corrige o desalinhamento que mascarava a ROI real em campo).
+- **Sensibilidade de presença** (0,25x–4x): multiplicador sobre os thresholds
+  auto-calibrados, aplicado SEM retreinar — corrige contagem zerada em campo.
+- **Diagnóstico na tela** (ligado por padrão): presença e anomalia ao vivo
+  contra seus thresholds, estado da máquina por item (VAZIO/AVALIANDO/...)
+  e FPS medido. É a ferramenta de comissionamento.
+- **Zerar Turno**.
+
+## FPS e slow-motion (avaliação para o M31)
+
+O app consulta os ranges de FPS do sensor e escolhe o **maior range FIXO até
+60 fps** (fallback 30/30). A 18k gph, 60 fps = 12 frames/ciclo — dobra a
+resolução temporal para capturar o vão entre garrafas.
+
+O slow-motion real do M31 (120–480 fps) **não é utilizável para inferência**:
+o Android implementa esses modos com "constrained high-speed session", que
+alimenta exclusivamente o encoder de vídeo, sem callback por frame para o
+ImageAnalysis. O ganho equivalente vem de 60 fps + exposição travada curta
+(AE lock), que também elimina o borrão de movimento — borrão é tempo de
+exposição, não taxa de quadros.
 
 ## Contagem inteligente — "Histerese por Item"
 
@@ -139,23 +173,25 @@ app/src/main/java/com/qa/inspecaocodificacao/
 ├── MainActivity.kt              # bind CameraX, 640x480, FPS 30/30, lock AE/AWB
 ├── InspectionViewModel.kt       # orquestrador: pipeline 2 estágios + estados
 ├── domain/
-│   ├── AppState.kt              # máquina de estados do APP
+│   ├── AppState.kt              # máquina de estados do APP + TrainingStatus
 │   ├── ItemStateMachine.kt      # máquina por ITEM (histerese, TFLite sob demanda)
+│   ├── RoiFractions.kt          # janela de medição ajustável (frações + clamp)
 │   └── InspectionConfig.kt      # dimensionamento 18k gph / M31 documentado
 ├── ml/
 │   ├── FeatureExtractor.kt      # TFLite MobileNetV3 160x160 (XNNPACK 4 threads)
-│   ├── InspectionModel.kt       # baseline: fundo + centroide + thresholds
-│   ├── CalibrationSession.kt    # fundo, thresholds de presença e k-sigma
-│   └── BaselineStore.kt         # persistência atômica da baseline (v2)
+│   ├── InspectionModel.kt       # BackgroundModel + ProductModel (independentes)
+│   ├── Trainers.kt              # BackgroundTrainer e ProductTrainer (1 por botão)
+│   └── BaselineStore.kt         # persistência atômica, fundo e padrão separados
 ├── camera/
 │   ├── FrameAnalyzer.kt         # Analyzer (KEEP_ONLY_LATEST, síncrono)
 │   ├── LumaGrid.kt              # ESTÁGIO 1: presença direto do buffer
-│   ├── RoiMapper.kt             # ROI display -> coordenadas do sensor (1x)
+│   ├── RoiMapper.kt             # ROI display -> coordenadas do sensor
 │   └── RoiCropper.kt            # ESTÁGIO 2: crop reutilizável p/ TFLite
 ├── alert/
 │   └── AlarmController.kt       # SoundPool em loop; torch opcional
 ├── data/
-│   └── MetricsRepository.kt     # contadores em memória + flush em lote
+│   ├── MetricsRepository.kt     # contadores em memória + flush em lote
+│   └── SettingsRepository.kt    # ROI, sensibilidade e diagnóstico persistidos
 └── ui/
     └── InspectionScreen.kt      # Compose: tela única à prova de operador
 ```

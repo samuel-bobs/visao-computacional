@@ -2,6 +2,7 @@ package com.qa.inspecaocodificacao
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureRequest
 import android.os.Bundle
 import android.util.Range
@@ -12,6 +13,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.camera.camera2.interop.Camera2CameraControl
+import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
@@ -33,10 +35,7 @@ class MainActivity : ComponentActivity() {
 
     private val viewModel: InspectionViewModel by viewModels()
 
-    /**
-     * Executor de THREAD ÚNICA para análise de frames: garante ordem dos
-     * frames e elimina condições de corrida na ItemStateMachine.
-     */
+    /** Thread única de análise: ordem dos frames e máquina por item sem locks. */
     private lateinit var analysisExecutor: ExecutorService
 
     private val permissionLauncher =
@@ -75,59 +74,99 @@ class MainActivity : ComponentActivity() {
         val providerFuture = ProcessCameraProvider.getInstance(this)
         providerFuture.addListener({
             val provider = providerFuture.get()
+            val fpsRange = selectFpsRange(provider, viewModel.config.maxAnalysisFps)
 
-            val preview = Preview.Builder().build().also { p ->
+            // 60 fps pode não ser suportado na combinação de tamanhos:
+            // tenta o range escolhido e cai para 30/30 se o bind falhar.
+            try {
+                bindUseCases(provider, fpsRange)
+            } catch (e: Exception) {
+                bindUseCases(provider, Range(30, 30))
+            }
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    /**
+     * Maior range de FPS FIXO suportado pelo sensor até maxFps.
+     * Range fixo (lower == upper): o AE não pode derrubar o frame rate em
+     * cena escura — frames a menos quebrariam o debounce da contagem.
+     *
+     * Nota slow-motion: os modos 120-480 fps do M31 usam sessão high-speed
+     * restrita que alimenta apenas o encoder de vídeo, sem callback por
+     * frame — inutilizáveis para inferência. 60 fps é o teto utilizável.
+     */
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun selectFpsRange(provider: ProcessCameraProvider, maxFps: Int): Range<Int> {
+        val info = CameraSelector.DEFAULT_BACK_CAMERA
+            .filter(provider.availableCameraInfos)
+            .firstOrNull() ?: return Range(30, 30)
+
+        val ranges = Camera2CameraInfo.from(info)
+            .getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            ?: return Range(30, 30)
+
+        return ranges
+            .filter { it.lower == it.upper && it.upper <= maxFps }
+            .maxByOrNull { it.upper }
+            ?: Range(30, 30)
+    }
+
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun bindUseCases(provider: ProcessCameraProvider, fpsRange: Range<Int>) {
+        // Preview e análise na MESMA proporção 4:3 + FIT no PreviewView:
+        // a moldura da ROI na tela corresponde 1:1 ao recorte analisado
+        // (correção do desalinhamento observado em campo).
+        val analysisResolution = ResolutionSelector.Builder()
+            .setResolutionStrategy(
+                ResolutionStrategy(
+                    Size(640, 480),
+                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                )
+            )
+            .build()
+
+        val previewResolution = ResolutionSelector.Builder()
+            .setResolutionStrategy(
+                ResolutionStrategy(
+                    Size(1280, 960), // 4:3 nítido para o ajuste da ROI
+                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                )
+            )
+            .build()
+
+        val preview = Preview.Builder()
+            .setResolutionSelector(previewResolution)
+            .build()
+            .also { p ->
                 previewView?.let { p.setSurfaceProvider(it.surfaceProvider) }
             }
 
-            // 640x480 basta: a ROI vira 160x160 no modelo e a grade de luma
-            // usa ~1k pixels. Resoluções maiores (o M31 entrega até 4k)
-            // só aumentariam o custo de cópia sem ganho de detecção.
-            val resolutionSelector = ResolutionSelector.Builder()
-                .setResolutionStrategy(
-                    ResolutionStrategy(
-                        Size(640, 480),
-                        ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
-                    )
-                )
-                .build()
+        val analysisBuilder = ImageAnalysis.Builder()
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+            .setResolutionSelector(analysisResolution)
 
-            val analysisBuilder = ImageAnalysis.Builder()
-                // Descarta frames atrasados em vez de enfileirar: latência constante.
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                .setResolutionSelector(resolutionSelector)
+        Camera2Interop.Extender(analysisBuilder).setCaptureRequestOption(
+            CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+            fpsRange,
+        )
 
-            // FPS FIXO em 30/30: a 18k garrafas/h (6 frames por ciclo) o AE
-            // não pode reduzir o frame rate em cena escura — frames a menos
-            // quebrariam o debounce da contagem.
-            Camera2Interop.Extender(analysisBuilder).setCaptureRequestOption(
-                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                Range(viewModel.config.targetFps, viewModel.config.targetFps),
-            )
+        val analysis = analysisBuilder.build()
+            .also { it.setAnalyzer(analysisExecutor, FrameAnalyzer(viewModel::onFrame)) }
 
-            val analysis = analysisBuilder.build()
-                .also { it.setAnalyzer(analysisExecutor, FrameAnalyzer(viewModel::onFrame)) }
+        provider.unbindAll()
+        val camera = provider.bindToLifecycle(
+            this,
+            CameraSelector.DEFAULT_BACK_CAMERA,
+            preview,
+            analysis,
+        )
 
-            provider.unbindAll()
-            val camera = provider.bindToLifecycle(
-                this,
-                CameraSelector.DEFAULT_BACK_CAMERA,
-                preview,
-                analysis,
-            )
+        // Câmera fixa: foco travado evita que o autofoco "cace" a garrafa.
+        camera.cameraControl.cancelFocusAndMetering()
 
-            // Câmera fixa: foco/exposição travados evitam que o autofoco
-            // "cace" quando a garrafa passa, o que mudaria a baseline.
-            camera.cameraControl.cancelFocusAndMetering()
-
-            // Lock de AE/AWB entregue ao ViewModel: travado após o início da
-            // calibração (cena assentada) e mantido o turno inteiro.
-            viewModel.exposureLocker = { locked -> setExposureLock(camera, locked) }
-
-            // Entrega o controle do torch ao alarme (se habilitado na config).
-            viewModel.alarmController.cameraControl = camera.cameraControl
-        }, ContextCompat.getMainExecutor(this))
+        viewModel.exposureLocker = { locked -> setExposureLock(camera, locked) }
+        viewModel.alarmController.cameraControl = camera.cameraControl
     }
 
     @OptIn(ExperimentalCamera2Interop::class)

@@ -3,32 +3,40 @@ package com.qa.inspecaocodificacao.domain
 /**
  * Máquina de estados PRINCIPAL do aplicativo.
  *
- * IDLE -> CALIBRANDO -> MONITORANDO <-> ALARME
- *            |                ^
- *            +----------------+
+ * Treinamento em DUAS etapas independentes (feedback de campo: a calibração
+ * monolítica de 60 s era inoperável com a linha rodando):
  *
- * O estado ALARME é transitório: dispara enquanto uma garrafa defeituosa
- * está na ROI e se auto-reseta quando ela sai (Estado D do item).
+ *   IDLE ──"TREINAR FUNDO"──> CALIBRANDO_FUNDO ──> IDLE (fundo ✓)
+ *   IDLE ──"TREINAR PADRÃO"──> CALIBRANDO_PADRÃO ──> MONITORANDO
+ *   IDLE ──"MONITORAR"──> MONITORANDO <-> ALARME
+ *   QA Admin ──"AJUSTAR ROI"──> ROI_SETUP ──> IDLE (exige retreino)
  */
 sealed interface AppState {
 
-    /** App aberto, aguardando o operador iniciar a calibração. */
+    /** Aguardando ação do operador. O que já foi treinado vem em TrainingStatus. */
     data object Idle : AppState
 
-    /** Aprendendo a baseline do produto atual. [progress] em 0..1. */
-    data class Calibrating(val progress: Float, val phase: CalibrationPhase) : AppState
+    /** Aprendendo o fundo (ROI vazia). [progress] em 0..1. */
+    data class CalibratingBackground(val progress: Float) : AppState
 
-    /** Produção: comparando cada frame contra a baseline. */
+    /**
+     * Aprendendo o padrão do produto bom com a produção rodando.
+     * [samples] = frames com garrafa já coletados (feedback ao operador).
+     */
+    data class CalibratingProduct(val progress: Float, val samples: Int) : AppState
+
+    /** Produção: estágio 1 em todo frame, estágio 2 sob demanda. */
     data object Monitoring : AppState
 
-    /** Garrafa defeituosa na ROI: tela vermelha + apito + flash. */
+    /** Garrafa defeituosa na ROI: tela vermelha + apito. */
     data class Alarm(val anomalyScore: Float) : AppState
+
+    /** Ajuste da janela de medição pelo usuário (arrastar/redimensionar). */
+    data object RoiSetup : AppState
 }
 
-enum class CalibrationPhase {
-    /** Esteira vazia: aprendendo o fundo (referência de presença). */
-    EMPTY_BELT,
-
-    /** Produção normal passando: aprendendo a assinatura do produto bom. */
-    PRODUCT,
-}
+/** O que já foi treinado — dirige quais botões a UI habilita. */
+data class TrainingStatus(
+    val hasBackground: Boolean = false,
+    val hasProduct: Boolean = false,
+)

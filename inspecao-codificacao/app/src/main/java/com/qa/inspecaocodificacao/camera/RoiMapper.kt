@@ -2,40 +2,42 @@ package com.qa.inspecaocodificacao.camera
 
 import android.graphics.Rect
 import androidx.camera.core.ImageProxy
-import com.qa.inspecaocodificacao.domain.InspectionConfig
+import com.qa.inspecaocodificacao.domain.RoiFractions
 
 /**
  * Converte a ROI (frações em coordenadas de EXIBIÇÃO, como o operador vê o
- * preview) para um Rect em coordenadas do BUFFER do sensor.
+ * preview 4:3) para um Rect em coordenadas do BUFFER do sensor.
  *
- * Otimização chave: em vez de rotacionar cada frame (cópia de 640x480 a
- * 30 fps), rotacionamos a ROI uma única vez. O modelo recebe o recorte na
- * orientação do sensor — como calibração e inferência usam a MESMA
- * orientação, a baseline permanece consistente sem custo por frame.
+ * O preview e a análise usam a MESMA proporção 4:3 com escala FIT
+ * (letterbox), então a moldura desenhada na tela corresponde 1:1 ao
+ * recorte analisado — correção do desalinhamento observado em campo.
+ *
+ * Em vez de rotacionar cada frame (cópia 640x480 a 30-60 fps),
+ * rotacionamos a ROI; calibração e inferência usam a mesma orientação.
  */
 object RoiMapper {
 
-    fun bufferRect(config: InspectionConfig, proxy: ImageProxy): Rect {
+    fun bufferRect(roi: RoiFractions, proxy: ImageProxy): Rect {
         val l: Float
         val t: Float
         val r: Float
         val b: Float
         when (proxy.imageInfo.rotationDegrees) {
             90 -> {
-                l = config.roiTop; t = 1f - config.roiRight
-                r = config.roiBottom; b = 1f - config.roiLeft
+                l = roi.top; t = 1f - roi.right
+                r = roi.bottom; b = 1f - roi.left
             }
             180 -> {
-                l = 1f - config.roiRight; t = 1f - config.roiBottom
-                r = 1f - config.roiLeft; b = 1f - config.roiTop
+                l = 1f - roi.right; t = 1f - roi.bottom
+                r = 1f - roi.left; b = 1f - roi.top
             }
             270 -> {
-                l = 1f - config.roiBottom; t = config.roiLeft
-                r = 1f - config.roiTop; b = config.roiRight
+                l = 1f - roi.bottom; t = roi.left
+                r = 1f - roi.top; b = roi.right
             }
             else -> {
-                l = config.roiLeft; t = config.roiTop
-                r = config.roiRight; b = config.roiBottom
+                l = roi.left; t = roi.top
+                r = roi.right; b = roi.bottom
             }
         }
 
