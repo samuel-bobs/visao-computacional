@@ -93,6 +93,7 @@ fun InspectionScreen(
 
     var showBackgroundDialog by remember { mutableStateOf(false) }
     var showProductDialog by remember { mutableStateOf(false) }
+    var showNewProductDialog by remember { mutableStateOf(false) }
     var showAdminDialog by remember { mutableStateOf(false) }
     var metricsVisible by remember { mutableStateOf(true) }
 
@@ -175,6 +176,7 @@ fun InspectionScreen(
                 onTrainBackground = { showBackgroundDialog = true },
                 onTrainProduct = { showProductDialog = true },
                 onMonitor = { viewModel.startMonitoring() },
+                onNewProduct = { showNewProductDialog = true },
                 modifier = Modifier.align(Alignment.Center),
             )
 
@@ -193,11 +195,13 @@ fun InspectionScreen(
             )
 
             is AppState.Monitoring -> {
-                TextButton(
+                Button(
                     onClick = { viewModel.stopMonitoring() },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF455A64)),
+                    shape = RoundedCornerShape(14.dp),
                     modifier = Modifier.align(Alignment.TopEnd).padding(12.dp),
                 ) {
-                    Text("PARAR", color = Color.White, fontWeight = FontWeight.Bold)
+                    Text("■ PARAR", fontSize = 18.sp, fontWeight = FontWeight.Black)
                 }
             }
 
@@ -285,6 +289,19 @@ fun InspectionScreen(
         )
     }
 
+    if (showNewProductDialog) {
+        ConfirmDialog(
+            title = "Trocar de produto",
+            text = "Isso APAGA o fundo, o padrão e as métricas do turno para " +
+                "recomeçar o treinamento do zero com o novo produto. Confirmar?",
+            onConfirm = {
+                showNewProductDialog = false
+                viewModel.startNewProduct()
+            },
+            onDismiss = { showNewProductDialog = false },
+        )
+    }
+
     if (showAdminDialog) {
         AdminDialog(
             sensitivity = settings.presenceSensitivity,
@@ -295,6 +312,10 @@ fun InspectionScreen(
                 showAdminDialog = false
                 editRoi = settings.roi
                 viewModel.enterRoiSetup()
+            },
+            onNewProduct = {
+                showAdminDialog = false
+                showNewProductDialog = true
             },
             onResetShift = {
                 showAdminDialog = false
@@ -334,6 +355,7 @@ private fun IdleContent(
     onTrainBackground: () -> Unit,
     onTrainProduct: () -> Unit,
     onMonitor: () -> Unit,
+    onNewProduct: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(modifier = modifier, horizontalAlignment = Alignment.CenterHorizontally) {
@@ -367,6 +389,22 @@ private fun IdleContent(
                 fontSize = 26.sp,
                 fontWeight = FontWeight.Black,
             )
+        }
+        // Troca de produto: visível só quando há algo treinado para apagar.
+        if (hasBackground || hasProduct) {
+            Spacer(Modifier.height(16.dp))
+            Button(
+                onClick = onNewProduct,
+                colors = ButtonDefaults.buttonColors(containerColor = OrangeWarn),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.size(width = 440.dp, height = 64.dp),
+            ) {
+                Text(
+                    text = "🔄 TROCAR PRODUTO (retreinar do zero)",
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Black,
+                )
+            }
         }
     }
 }
@@ -661,6 +699,7 @@ private fun AdminDialog(
     onSensitivity: (Float) -> Unit,
     onShowDiagnostics: (Boolean) -> Unit,
     onAdjustRoi: () -> Unit,
+    onNewProduct: () -> Unit,
     onResetShift: () -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -693,6 +732,14 @@ private fun AdminDialog(
                 Spacer(Modifier.height(8.dp))
                 Button(onClick = onAdjustRoi, modifier = Modifier.fillMaxWidth()) {
                     Text("AJUSTAR JANELA DE MEDIÇÃO (ROI)")
+                }
+                Spacer(Modifier.height(8.dp))
+                Button(
+                    onClick = onNewProduct,
+                    colors = ButtonDefaults.buttonColors(containerColor = OrangeWarn),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("TROCAR PRODUTO (retreinar do zero)")
                 }
                 Spacer(Modifier.height(8.dp))
                 Button(

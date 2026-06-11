@@ -232,6 +232,22 @@ class InspectionViewModel(application: Application) : AndroidViewModel(applicati
         _appState.value = AppState.Idle
     }
 
+    /**
+     * Botão "TROCAR PRODUTO": apaga fundo, padrão e métricas numa ação
+     * única e guia o operador de volta ao passo 1 (feedback de campo:
+     * não havia método claro para reiniciar o treinamento do zero).
+     */
+    fun startNewProduct() {
+        stopAlarmAndReset()
+        baselineStore.clearAll()
+        backgroundModel = null
+        productModel = null
+        publishTrainingStatus()
+        viewModelScope.launch { metricsRepository.resetShift() }
+        _uiMessage.value = "Produto trocado. Passo 1: treine o FUNDO com a ROI vazia."
+        _appState.value = AppState.Idle
+    }
+
     // ----------------------------- ROI em campo -----------------------------
 
     fun enterRoiSetup() {

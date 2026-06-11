@@ -50,7 +50,9 @@ calibração monolítica de 60 s era inoperável com a linha rodando):
 ```
 IDLE ──"1·TREINAR FUNDO" (ROI vazia, ~13 s)──> TREINANDO FUNDO ──> IDLE (fundo ✓)
 IDLE ──"2·TREINAR PADRÃO" (produção, ~45 s)──> TREINANDO PADRÃO ──> MONITORANDO
-IDLE ──"MONITORAR"──> MONITORANDO <──auto-reset com retenção──> ALARME
+IDLE ──"MONITORAR"──> MONITORANDO ──"■ PARAR"──> IDLE
+MONITORANDO <──auto-reset com retenção──> ALARME
+IDLE/QA Admin ──"TROCAR PRODUTO"──> apaga fundo+padrão+métricas ──> IDLE (passo 1)
 QA Admin ──"AJUSTAR ROI"──> ROI_SETUP (arrastar/redimensionar) ──> IDLE (retreino)
 ```
 
