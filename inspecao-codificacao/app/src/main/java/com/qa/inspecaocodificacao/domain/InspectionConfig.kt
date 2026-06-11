@@ -25,16 +25,33 @@ data class InspectionConfig(
     val aeSettleMs: Long = 2_500L,
 
     /**
-     * Thresholds de presença AUTO-CALIBRADOS a partir do ruído do fundo:
-     *   T_enter = ruído_médio + enterSigma * desvio   (piso: enterFloor)
-     *   T_exit  = ruído_médio + exitSigma  * desvio   (piso: exitFloor)
-     * O usuário ainda aplica um multiplicador de sensibilidade em campo
-     * (modo QA Admin) sem retreinar.
+     * PRESENÇA v2 — fração de células alteradas (background subtraction):
+     * cada célula tem ruído próprio aprendido no treino de fundo; uma célula
+     * "mudou" se |desvio − deslocamento global| > max(cellSigmaK*σ_célula,
+     * minCellDelta). O score é a FRAÇÃO de células ativas que mudaram —
+     * robusto a garrafas que ocupam só parte da ROI (a métrica antiga de
+     * média diluía o sinal e zerava a contagem em campo).
+     */
+    val cellSigmaK: Float = 6f,
+    val minCellDelta: Float = 8f, // níveis de luma (0-255)
+
+    /**
+     * Thresholds de presença sobre a fração de células: auto-calibrados pelo
+     * ruído do fundo (k-sigma) com pisos interpretáveis — entrar exige ~12%
+     * das células alteradas, sair é voltar abaixo de ~6%.
      */
     val presenceEnterSigma: Float = 8f,
     val presenceExitSigma: Float = 4f,
-    val presenceEnterFloor: Float = 0.020f,
-    val presenceExitFloor: Float = 0.012f,
+    val presenceEnterFloor: Float = 0.12f,
+    val presenceExitFloor: Float = 0.06f,
+
+    /**
+     * Gate de centralização do estágio 2: o treino do padrão aprende o pico
+     * típico de presença e só usa (no treino E na inferência) frames acima
+     * deste percentil — garrafas meio dentro/meio fora inflavam o desvio e
+     * tornavam o threshold de defeito inalcançável (defeitos nunca contavam).
+     */
+    val productGatePercentile: Float = 0.60f,
 
     /** Debounce para 5 garrafas/s (1 confirma entrada, 2 confirmam saída). */
     val enterDebounceFrames: Int = 1,

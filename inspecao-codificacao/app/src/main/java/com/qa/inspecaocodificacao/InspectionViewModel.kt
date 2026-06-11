@@ -15,6 +15,7 @@ import com.qa.inspecaocodificacao.data.MetricsRepository
 import com.qa.inspecaocodificacao.data.SettingsRepository
 import com.qa.inspecaocodificacao.data.ShiftMetrics
 import com.qa.inspecaocodificacao.domain.AppState
+import com.qa.inspecaocodificacao.domain.CellMask
 import com.qa.inspecaocodificacao.domain.InspectionConfig
 import com.qa.inspecaocodificacao.domain.ItemStateMachine
 import com.qa.inspecaocodificacao.domain.RoiFractions
@@ -37,45 +38,61 @@ import kotlinx.coroutines.runBlocking
 
 /** Telemetria ao vivo para o comissionamento (overlay de diagnóstico). */
 data class PipelineDiagnostics(
-    val presenceScore: Float = 0f,
+    val presenceScore: Float = 0f,       // fração de células alteradas (0..1)
     val lastAnomalyScore: Float = 0f,
     val itemState: String = "—",
     val presenceEnter: Float = 0f,
     val presenceExit: Float = 0f,
     val defectThreshold: Float = 0f,
+    val centerGate: Float = 0f,
     val fps: Int = 0,
 )
 
 /**
- * Orquestrador central. Mudanças do feedback de campo:
- *  - Treino de FUNDO e de PADRÃO em botões/estados independentes;
- *  - Falhas de treino geram mensagem visível (antes o app voltava a IDLE
- *    em silêncio e o operador achava que estava monitorando);
- *  - ROI ajustável em campo (persistida; alterá-la invalida os treinos);
- *  - Sensibilidade de presença ajustável sem retreino;
- *  - Diagnóstico ao vivo: presença, anomalia, estado do item, fps.
+ * Orquestrador central — revisão profunda pós-campo:
+ *  - Presença v2: fração de células alteradas com ruído por célula e
+ *    compensação de iluminação (a média global diluía o sinal);
+ *  - Gate de centralização no estágio 2 (treino e inferência só com a
+ *    garrafa centralizada — corrige threshold de defeito inalcançável);
+ *  - Máscara de células editável pelo usuário (exclui reflexos/máquina);
+ *  - Zoom da câmera ajustável e persistido.
  */
 class InspectionViewModel(application: Application) : AndroidViewModel(application) {
 
     val config = InspectionConfig()
 
     private val featureExtractor = FeatureExtractor(application, config.useGpuDelegate)
-    private val baselineStore = BaselineStore(application)
+    private val baselineStore = BaselineStore(application, config)
     private val settingsRepository = SettingsRepository(application)
     private val metricsRepository =
         MetricsRepository(application, viewModelScope, config.metricsFlushIntervalMs)
     val alarmController = AlarmController(application, viewModelScope, config.useTorchOnAlarm)
 
-    /** Lock de AE/AWB (Camera2Interop), injetado pela Activity após o bind. */
+    // ----- Integração com a câmera (injetada pela Activity após o bind) -----
     @Volatile var exposureLocker: ((Boolean) -> Unit)? = null
+    @Volatile private var zoomApplier: ((Float) -> Unit)? = null
 
+    private val _maxZoom = MutableStateFlow(1f)
+    val maxZoom: StateFlow<Float> = _maxZoom.asStateFlow()
+
+    fun attachCameraZoom(maxZoomRatio: Float, applier: (Float) -> Unit) {
+        _maxZoom.value = maxZoomRatio
+        zoomApplier = applier
+        applier(settings.value.zoomRatio)
+    }
+
+    /** Zoom ao vivo durante o ajuste (persistido apenas no SALVAR). */
+    fun previewZoom(ratio: Float) {
+        zoomApplier?.invoke(ratio)
+    }
+
+    // ------------------------------- Estado --------------------------------
     private val _appState = MutableStateFlow<AppState>(AppState.Idle)
     val appState: StateFlow<AppState> = _appState.asStateFlow()
 
     private val _trainingStatus = MutableStateFlow(TrainingStatus())
     val trainingStatus: StateFlow<TrainingStatus> = _trainingStatus.asStateFlow()
 
-    /** Mensagens operacionais (falha de treino, ROI salva...). */
     private val _uiMessage = MutableStateFlow<String?>(null)
     val uiMessage: StateFlow<String?> = _uiMessage.asStateFlow()
 
@@ -96,6 +113,10 @@ class InspectionViewModel(application: Application) : AndroidViewModel(applicati
 
     private var cachedRoi: RoiFractions? = null
     private var cachedRect: Rect? = null
+    private var cachedMaskString: String? = null
+    private var cachedRotation = -1
+    private var bufferMask: CellMask = CellMask.empty()
+
     private val lumaGrid = FloatArray(LumaGrid.CELLS) // reutilizada por frame
     private val roiCropper = RoiCropper()
 
@@ -141,9 +162,12 @@ class InspectionViewModel(application: Application) : AndroidViewModel(applicati
             _appState.value = AppState.Monitoring
         }
 
-        // Sensibilidade/ROI mudam em runtime: reconfigura a máquina por item.
+        // Sensibilidade/zoom mudam em runtime.
         viewModelScope.launch {
-            settings.collect { reconfigureMachine() }
+            settings.collect {
+                reconfigureMachine()
+                zoomApplier?.invoke(it.zoomRatio)
+            }
         }
     }
 
@@ -175,7 +199,6 @@ class InspectionViewModel(application: Application) : AndroidViewModel(applicati
     /** Botão "TREINAR FUNDO" (ROI vazia). Confirmado em diálogo. */
     fun startBackgroundTraining() {
         stopAlarmAndReset()
-        // Fundo novo invalida o padrão (thresholds e gate mudam).
         productModel = null
         baselineStore.clearProduct()
         backgroundModel = null
@@ -184,7 +207,6 @@ class InspectionViewModel(application: Application) : AndroidViewModel(applicati
         backgroundTrainer = BackgroundTrainer(config)
         trainingStartMs = SystemClock.elapsedRealtime()
 
-        // Destrava AE/AWB, deixa assentar e trava: exposição fixa o turno todo.
         exposureLocker?.invoke(false)
         viewModelScope.launch {
             delay(config.aeSettleMs)
@@ -205,7 +227,7 @@ class InspectionViewModel(application: Application) : AndroidViewModel(applicati
         productModel = null
         publishTrainingStatus()
 
-        productTrainer = ProductTrainer(config, bg, effectiveEnter(bg))
+        productTrainer = ProductTrainer(config, bg, bufferMask, effectiveEnter(bg))
         trainingStartMs = SystemClock.elapsedRealtime()
         viewModelScope.launch { metricsRepository.resetShift() }
         _appState.value = AppState.CalibratingProduct(0f, 0)
@@ -232,11 +254,7 @@ class InspectionViewModel(application: Application) : AndroidViewModel(applicati
         _appState.value = AppState.Idle
     }
 
-    /**
-     * Botão "TROCAR PRODUTO": apaga fundo, padrão e métricas numa ação
-     * única e guia o operador de volta ao passo 1 (feedback de campo:
-     * não havia método claro para reiniciar o treinamento do zero).
-     */
+    /** Botão "TROCAR PRODUTO": apaga fundo, padrão e métricas. */
     fun startNewProduct() {
         stopAlarmAndReset()
         baselineStore.clearAll()
@@ -248,7 +266,7 @@ class InspectionViewModel(application: Application) : AndroidViewModel(applicati
         _appState.value = AppState.Idle
     }
 
-    // ----------------------------- ROI em campo -----------------------------
+    // -------------------- Ajuste de campo (ROI/máscara/zoom) --------------------
 
     fun enterRoiSetup() {
         stopAlarmAndReset()
@@ -256,18 +274,26 @@ class InspectionViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun cancelRoiSetup() {
+        // Restaura o zoom persistido (o slider pode ter mudado ao vivo).
+        zoomApplier?.invoke(settings.value.zoomRatio)
         _appState.value = AppState.Idle
     }
 
-    /** Salvar ROI invalida fundo e padrão (grades/embeddings presos ao recorte). */
-    fun saveRoi(roi: RoiFractions) {
-        viewModelScope.launch { settingsRepository.setRoi(roi) }
+    /** ROI + máscara + zoom salvos juntos; tudo treinado deixa de valer. */
+    fun saveMeasurementSetup(roi: RoiFractions, maskedCells: Set<Int>, zoomRatio: Float) {
+        viewModelScope.launch {
+            settingsRepository.setMeasurementSetup(
+                roi = roi,
+                maskString = CellMask.serialize(maskedCells),
+                zoomRatio = zoomRatio,
+            )
+        }
         baselineStore.clearAll()
         backgroundModel = null
         productModel = null
         itemMachine.reset()
         publishTrainingStatus()
-        _uiMessage.value = "ROI salva. Retreine o fundo e o padrão para o novo formato."
+        _uiMessage.value = "Ajuste salvo. Retreine o fundo e o padrão para a nova janela."
         _appState.value = AppState.Idle
     }
 
@@ -303,20 +329,27 @@ class InspectionViewModel(application: Application) : AndroidViewModel(applicati
         val state = _appState.value
         trackFps()
 
-        // ROI dinâmica (ajustável em campo): recalcula o Rect só quando muda.
-        val roiFractions = settings.value.roi
-        val roi = if (roiFractions == cachedRoi) {
+        val current = settings.value
+        val rotation = proxy.imageInfo.rotationDegrees
+
+        // Caches dependentes de ROI/máscara/rotação (mudam raramente).
+        val roi = if (current.roi == cachedRoi && rotation == cachedRotation) {
             cachedRect!!
         } else {
-            RoiMapper.bufferRect(roiFractions, proxy).also {
-                cachedRoi = roiFractions
+            RoiMapper.bufferRect(current.roi, proxy).also {
+                cachedRoi = current.roi
                 cachedRect = it
             }
         }
+        if (current.maskString != cachedMaskString || rotation != cachedRotation) {
+            bufferMask = CellMask.fromString(current.maskString).toBufferOrientation(rotation)
+            cachedMaskString = current.maskString
+        }
+        cachedRotation = rotation
 
-        // ESTÁGIO 1: grade de luma em todo frame (também alimenta o diagnóstico).
+        // ESTÁGIO 1: grade de luma + fração de células alteradas.
         LumaGrid.sample(proxy, roi, lumaGrid)
-        val presence = backgroundModel?.presenceScore(lumaGrid) ?: 0f
+        val presence = backgroundModel?.presenceScore(lumaGrid, bufferMask) ?: 0f
 
         when (state) {
             is AppState.CalibratingBackground -> onBackgroundFrame()
@@ -326,15 +359,18 @@ class InspectionViewModel(application: Application) : AndroidViewModel(applicati
                     presenceScore = presence,
                     anomalyScore = anomaly@{
                         val pm = productModel ?: return@anomaly 0f
+                        // Gate de centralização: TFLite só com a garrafa
+                        // centralizada na ROI (frames de borda distorcem).
+                        if (presence < pm.presenceGate) return@anomaly 0f
                         val score = pm.anomalyScore(
-                            featureExtractor.extract(roiCropper.crop(proxy, roi))
+                            featureExtractor.extract(roiCropper.crop(proxy, roi, bufferMask))
                         )
                         lastAnomaly = score
                         score
                     },
                 )
             }
-            is AppState.Idle, is AppState.RoiSetup -> Unit // estágio 1 já alimenta o overlay
+            is AppState.Idle, is AppState.RoiSetup -> Unit // estágio 1 alimenta o overlay
         }
 
         publishDiagnostics(presence)
@@ -346,14 +382,13 @@ class InspectionViewModel(application: Application) : AndroidViewModel(applicati
         val total = config.aeSettleMs + config.backgroundTrainingMs
 
         if (elapsed < total) {
-            // Descarta o início: AE/AWB ainda assentando antes do lock.
             if (elapsed >= config.aeSettleMs) trainer.add(lumaGrid)
             _appState.value = AppState.CalibratingBackground(elapsed.toFloat() / total)
             return
         }
 
         backgroundTrainer = null
-        val model = trainer.build()
+        val model = trainer.build(bufferMask)
         if (model == null) {
             _uiMessage.value = "Treino do FUNDO falhou: frames insuficientes. Tente novamente."
         } else {
@@ -371,10 +406,9 @@ class InspectionViewModel(application: Application) : AndroidViewModel(applicati
         val elapsed = SystemClock.elapsedRealtime() - trainingStartMs
 
         if (elapsed < config.productTrainingMs) {
-            val sampled = trainer.addFrame(lumaGrid) {
-                featureExtractor.extract(roiCropper.crop(proxy, roi))
+            trainer.addFrame(lumaGrid) {
+                featureExtractor.extract(roiCropper.crop(proxy, roi, bufferMask))
             }
-            if (sampled) lastAnomaly = 0f
             _appState.value = AppState.CalibratingProduct(
                 progress = elapsed.toFloat() / config.productTrainingMs,
                 samples = trainer.samples,
@@ -385,9 +419,8 @@ class InspectionViewModel(application: Application) : AndroidViewModel(applicati
         productTrainer = null
         val model = trainer.build()
         if (model == null) {
-            // ANTES era silencioso — causa raiz do "não contou nada" em campo.
-            _uiMessage.value = "Treino do PADRÃO falhou: nenhuma garrafa detectada na ROI " +
-                "(${trainer.samples} amostras). Verifique a ROI e aumente a sensibilidade."
+            _uiMessage.value = "Treino do PADRÃO falhou: poucas garrafas detectadas na ROI " +
+                "(${trainer.samples} amostras). Verifique a janela e aumente a sensibilidade."
             publishTrainingStatus()
             _appState.value = AppState.Idle
             return
@@ -426,6 +459,7 @@ class InspectionViewModel(application: Application) : AndroidViewModel(applicati
             presenceEnter = bg?.let { effectiveEnter(it) } ?: 0f,
             presenceExit = bg?.let { effectiveExit(it) } ?: 0f,
             defectThreshold = productModel?.defectThreshold ?: 0f,
+            centerGate = productModel?.presenceGate ?: 0f,
             fps = measuredFps,
         )
     }
@@ -433,7 +467,6 @@ class InspectionViewModel(application: Application) : AndroidViewModel(applicati
     override fun onCleared() {
         alarmController.release()
         featureExtractor.close()
-        // Última gravação dos contadores (escrita pequena; scope já cancelado).
         runBlocking { metricsRepository.flush() }
     }
 }

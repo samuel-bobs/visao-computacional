@@ -167,6 +167,12 @@ class MainActivity : ComponentActivity() {
 
         viewModel.exposureLocker = { locked -> setExposureLock(camera, locked) }
         viewModel.alarmController.cameraControl = camera.cameraControl
+
+        // Zoom: amplia a região da codificação sem mover o suporte físico.
+        val maxZoom = camera.cameraInfo.zoomState.value?.maxZoomRatio ?: 1f
+        viewModel.attachCameraZoom(maxZoom) { ratio ->
+            camera.cameraControl.setZoomRatio(ratio.coerceIn(1f, maxZoom))
+        }
     }
 
     @OptIn(ExperimentalCamera2Interop::class)

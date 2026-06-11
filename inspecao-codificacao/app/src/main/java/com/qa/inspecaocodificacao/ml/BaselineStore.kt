@@ -1,6 +1,7 @@
 package com.qa.inspecaocodificacao.ml
 
 import android.content.Context
+import com.qa.inspecaocodificacao.domain.InspectionConfig
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
@@ -8,13 +9,13 @@ import java.io.File
 /**
  * Persiste fundo e padrão em arquivos SEPARADOS (treinos independentes):
  * reinício acidental volta direto a MONITORANDO com o que já foi treinado.
- * Escrita atômica (tmp + rename): nunca deixa baseline corrompida.
+ * Escrita atômica (tmp + rename). Versão incompatível => retreino.
  */
-class BaselineStore(context: Context) {
+class BaselineStore(context: Context, private val config: InspectionConfig) {
 
     private companion object {
-        const val BG_VERSION = 1
-        const val PRODUCT_VERSION = 1
+        const val BG_VERSION = 2      // v2: + sigma por célula
+        const val PRODUCT_VERSION = 2 // v2: + gate de centralização
     }
 
     private val bgFile = File(context.filesDir, "background.bin")
@@ -23,8 +24,9 @@ class BaselineStore(context: Context) {
 
     fun saveBackground(model: BackgroundModel) = atomicWrite(bgFile) { out ->
         out.writeInt(BG_VERSION)
-        out.writeInt(model.grid.size)
-        model.grid.forEach(out::writeFloat)
+        out.writeInt(model.refGrid.size)
+        model.refGrid.forEach(out::writeFloat)
+        model.sigmaGrid.forEach(out::writeFloat)
         out.writeFloat(model.presenceEnterThreshold)
         out.writeFloat(model.presenceExitThreshold)
     }
@@ -34,8 +36,17 @@ class BaselineStore(context: Context) {
         return runCatching {
             DataInputStream(bgFile.inputStream().buffered()).use { input ->
                 check(input.readInt() == BG_VERSION)
-                val grid = FloatArray(input.readInt()) { input.readFloat() }
-                BackgroundModel(grid, input.readFloat(), input.readFloat())
+                val size = input.readInt()
+                val ref = FloatArray(size) { input.readFloat() }
+                val sigma = FloatArray(size) { input.readFloat() }
+                BackgroundModel(
+                    refGrid = ref,
+                    sigmaGrid = sigma,
+                    presenceEnterThreshold = input.readFloat(),
+                    presenceExitThreshold = input.readFloat(),
+                    cellSigmaK = config.cellSigmaK,
+                    minCellDelta = config.minCellDelta,
+                )
             }
         }.getOrNull()
     }
@@ -45,6 +56,7 @@ class BaselineStore(context: Context) {
         out.writeInt(model.centroid.size)
         model.centroid.forEach(out::writeFloat)
         out.writeFloat(model.defectThreshold)
+        out.writeFloat(model.presenceGate)
     }
 
     fun loadProduct(): ProductModel? {
@@ -53,12 +65,12 @@ class BaselineStore(context: Context) {
             DataInputStream(productFile.inputStream().buffered()).use { input ->
                 check(input.readInt() == PRODUCT_VERSION)
                 val centroid = FloatArray(input.readInt()) { input.readFloat() }
-                ProductModel(centroid, input.readFloat())
+                ProductModel(centroid, input.readFloat(), input.readFloat())
             }
         }.getOrNull()
     }
 
-    /** ROI alterada: tudo que foi treinado deixa de valer. */
+    /** ROI/máscara/zoom alterados ou troca de produto: nada treinado vale. */
     fun clearAll() {
         bgFile.delete()
         productFile.delete()

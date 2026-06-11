@@ -4,22 +4,26 @@ import android.content.Context
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.qa.inspecaocodificacao.domain.CellMask
 import com.qa.inspecaocodificacao.domain.RoiFractions
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 
 /**
  * Ajustes de campo persistidos — sobrevivem a reinício:
- *  - ROI (janela de medição): ajustada pelo usuário para cada formato de garrafa;
- *  - sensibilidade de presença: multiplicador sobre os thresholds auto-calibrados
- *    (permite corrigir contagem em campo SEM retreinar o fundo);
- *  - overlay de diagnóstico: scores ao vivo para o comissionamento.
+ *  - ROI (janela de medição) + MÁSCARA de células ignoradas + ZOOM da câmera,
+ *    salvos juntos no modo de ajuste (alterá-los invalida os treinos);
+ *  - sensibilidade de presença: multiplicador sobre os thresholds, sem retreino;
+ *  - overlay de diagnóstico.
  */
 data class InspectionSettings(
     val roi: RoiFractions = RoiFractions(),
+    val maskString: String = "",
+    val zoomRatio: Float = 1f,
     val presenceSensitivity: Float = 1f, // 0.25..4; maior = dispara mais fácil
-    val showDiagnostics: Boolean = true, // ligado por padrão até o piloto estabilizar
+    val showDiagnostics: Boolean = true,
 )
 
 private val Context.settingsStore by preferencesDataStore(name = "inspection_settings")
@@ -31,6 +35,8 @@ class SettingsRepository(private val context: Context) {
         val ROI_TOP = floatPreferencesKey("roi_top")
         val ROI_RIGHT = floatPreferencesKey("roi_right")
         val ROI_BOTTOM = floatPreferencesKey("roi_bottom")
+        val MASK = stringPreferencesKey("cell_mask")
+        val ZOOM = floatPreferencesKey("zoom_ratio")
         val SENSITIVITY = floatPreferencesKey("presence_sensitivity")
         val SHOW_DIAGNOSTICS = booleanPreferencesKey("show_diagnostics")
     }
@@ -44,18 +50,23 @@ class SettingsRepository(private val context: Context) {
                 right = prefs[Keys.ROI_RIGHT] ?: default.right,
                 bottom = prefs[Keys.ROI_BOTTOM] ?: default.bottom,
             ).clamped(),
+            maskString = prefs[Keys.MASK]?.takeIf { it.length == CellMask.CELLS } ?: "",
+            zoomRatio = (prefs[Keys.ZOOM] ?: 1f).coerceAtLeast(1f),
             presenceSensitivity = (prefs[Keys.SENSITIVITY] ?: 1f).coerceIn(0.25f, 4f),
             showDiagnostics = prefs[Keys.SHOW_DIAGNOSTICS] ?: true,
         )
     }
 
-    suspend fun setRoi(roi: RoiFractions) {
+    /** ROI + máscara + zoom salvos atomicamente (ajuste de campo). */
+    suspend fun setMeasurementSetup(roi: RoiFractions, maskString: String, zoomRatio: Float) {
         val r = roi.clamped()
         context.settingsStore.edit { prefs ->
             prefs[Keys.ROI_LEFT] = r.left
             prefs[Keys.ROI_TOP] = r.top
             prefs[Keys.ROI_RIGHT] = r.right
             prefs[Keys.ROI_BOTTOM] = r.bottom
+            prefs[Keys.MASK] = maskString
+            prefs[Keys.ZOOM] = zoomRatio.coerceAtLeast(1f)
         }
     }
 

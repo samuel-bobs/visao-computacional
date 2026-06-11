@@ -7,11 +7,13 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -49,7 +51,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
@@ -60,6 +65,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.qa.inspecaocodificacao.InspectionViewModel
 import com.qa.inspecaocodificacao.PipelineDiagnostics
 import com.qa.inspecaocodificacao.domain.AppState
+import com.qa.inspecaocodificacao.domain.CellMask
 import com.qa.inspecaocodificacao.domain.RoiFractions
 import java.util.Locale
 
@@ -97,8 +103,12 @@ fun InspectionScreen(
     var showAdminDialog by remember { mutableStateOf(false) }
     var metricsVisible by remember { mutableStateOf(true) }
 
-    // ROI em edição (só no modo RoiSetup); inicia na ROI persistida.
+    // Ajuste de campo em edição (só no modo RoiSetup).
     var editRoi by remember { mutableStateOf(settings.roi) }
+    var editMask by remember { mutableStateOf(setOf<Int>()) }
+    var editZoom by remember { mutableStateOf(settings.zoomRatio) }
+    var setupTool by remember { mutableStateOf(SetupTool.JANELA) }
+    val maxZoom by viewModel.maxZoom.collectAsState()
 
     Box(modifier = Modifier.fillMaxSize().background(DarkBg)) {
 
@@ -120,13 +130,34 @@ fun InspectionScreen(
             )
 
             if (state is AppState.RoiSetup) {
-                RoiEditor(
-                    roi = editRoi,
-                    onChange = { editRoi = it },
+                when (setupTool) {
+                    SetupTool.JANELA -> RoiEditor(
+                        roi = editRoi,
+                        mask = editMask,
+                        onChange = { editRoi = it },
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                    SetupTool.MASCARA -> MaskEditor(
+                        roi = editRoi,
+                        mask = editMask,
+                        onChange = { editMask = it },
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                    SetupTool.ZOOM -> RoiEditor(
+                        roi = editRoi,
+                        mask = editMask,
+                        onChange = { },
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
+            } else {
+                RoiFrame(
+                    roi = settings.roi,
+                    mask = remember(settings.maskString) {
+                        maskedSetFromString(settings.maskString)
+                    },
                     modifier = Modifier.fillMaxSize(),
                 )
-            } else {
-                RoiFrame(roi = settings.roi, modifier = Modifier.fillMaxSize())
             }
         }
 
@@ -206,9 +237,21 @@ fun InspectionScreen(
             }
 
             is AppState.RoiSetup -> RoiSetupControls(
-                onSave = { viewModel.saveRoi(editRoi) },
+                tool = setupTool,
+                onTool = { setupTool = it },
+                zoom = editZoom,
+                maxZoom = maxZoom,
+                onZoom = {
+                    editZoom = it
+                    viewModel.previewZoom(it) // feedback imediato no preview
+                },
+                maskedCount = editMask.size,
+                onClearMask = { editMask = emptySet() },
+                onSave = { viewModel.saveMeasurementSetup(editRoi, editMask, editZoom) },
                 onCancel = {
                     editRoi = settings.roi
+                    editMask = maskedSetFromString(settings.maskString)
+                    editZoom = settings.zoomRatio
                     viewModel.cancelRoiSetup()
                 },
                 modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 16.dp),
@@ -311,6 +354,9 @@ fun InspectionScreen(
             onAdjustRoi = {
                 showAdminDialog = false
                 editRoi = settings.roi
+                editMask = maskedSetFromString(settings.maskString)
+                editZoom = settings.zoomRatio
+                setupTool = SetupTool.JANELA
                 viewModel.enterRoiSetup()
             },
             onNewProduct = {
@@ -515,8 +561,31 @@ private fun DiagnosticsPanel(
         shape = RoundedCornerShape(12.dp),
     ) {
         Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) {
-            DiagLine("presença", diagnostics.presenceScore, diagnostics.presenceEnter)
-            DiagLine("anomalia", diagnostics.lastAnomalyScore, diagnostics.defectThreshold)
+            // Presença em % de células alteradas (entra/sai/gate de avaliação).
+            DiagLine(
+                label = "presença",
+                text = String.format(
+                    Locale.US,
+                    "%4.0f%%  ent %.0f%% · sai %.0f%% · aval %.0f%%",
+                    diagnostics.presenceScore * 100,
+                    diagnostics.presenceEnter * 100,
+                    diagnostics.presenceExit * 100,
+                    diagnostics.centerGate * 100,
+                ),
+                over = diagnostics.presenceEnter > 0f &&
+                    diagnostics.presenceScore > diagnostics.presenceEnter,
+            )
+            DiagLine(
+                label = "anomalia",
+                text = String.format(
+                    Locale.US,
+                    "%.4f / limite %.4f",
+                    diagnostics.lastAnomalyScore,
+                    diagnostics.defectThreshold,
+                ),
+                over = diagnostics.defectThreshold > 0f &&
+                    diagnostics.lastAnomalyScore > diagnostics.defectThreshold,
+            )
             Text(
                 text = "item: ${diagnostics.itemState}   fps: ${diagnostics.fps}",
                 color = Color.LightGray,
@@ -528,37 +597,80 @@ private fun DiagnosticsPanel(
 }
 
 @Composable
-private fun DiagLine(label: String, value: Float, threshold: Float) {
-    val over = threshold > 0f && value > threshold
+private fun DiagLine(label: String, text: String, over: Boolean) {
     Text(
-        text = String.format(Locale.US, "%-8s %.4f / %.4f", label, value, threshold),
+        text = String.format(Locale.US, "%-9s %s", label, text),
         color = if (over) Color.Yellow else Color.White,
         fontSize = 13.sp,
         fontFamily = FontFamily.Monospace,
     )
 }
 
-/** Moldura estática da ROI (fora do modo de edição). */
-@Composable
-private fun RoiFrame(roi: RoiFractions, modifier: Modifier = Modifier) {
-    androidx.compose.foundation.layout.BoxWithConstraints(modifier) {
-        Box(
-            modifier = Modifier
-                .padding(start = maxWidth * roi.left, top = maxHeight * roi.top)
-                .width(maxWidth * roi.width())
-                .height(maxHeight * roi.height())
-                .border(3.dp, Color.Yellow, RoundedCornerShape(8.dp)),
+// ------------------- Janela de medição: desenho e edição -------------------
+
+enum class SetupTool { JANELA, MASCARA, ZOOM }
+
+private fun maskedSetFromString(s: String): Set<Int> =
+    if (s.length != CellMask.CELLS) emptySet()
+    else s.withIndex().filter { it.value == '1' }.map { it.index }.toSet()
+
+/** Desenho compartilhado: moldura da ROI + células mascaradas (+ grade). */
+private fun DrawScope.drawRoiOverlay(
+    roi: RoiFractions,
+    mask: Set<Int>,
+    showGrid: Boolean,
+    borderWidthPx: Float,
+) {
+    val grid = CellMask.GRID
+    val left = roi.left * size.width
+    val top = roi.top * size.height
+    val w = roi.width() * size.width
+    val h = roi.height() * size.height
+    val cw = w / grid
+    val ch = h / grid
+
+    if (showGrid) {
+        val gridColor = Color.White.copy(alpha = 0.35f)
+        for (i in 0..grid) {
+            drawLine(gridColor, Offset(left + i * cw, top), Offset(left + i * cw, top + h), 1f)
+            drawLine(gridColor, Offset(left, top + i * ch), Offset(left + w, top + i * ch), 1f)
+        }
+    }
+
+    for (idx in mask) {
+        val gx = idx % grid
+        val gy = idx / grid
+        drawRect(
+            color = RedAlarm.copy(alpha = 0.45f),
+            topLeft = Offset(left + gx * cw, top + gy * ch),
+            size = Size(cw, ch),
         )
+    }
+
+    drawRect(
+        color = Color.Yellow,
+        topLeft = Offset(left, top),
+        size = Size(w, h),
+        style = Stroke(borderWidthPx),
+    )
+}
+
+/** Moldura estática da ROI + máscara ativa (fora do modo de edição). */
+@Composable
+private fun RoiFrame(roi: RoiFractions, mask: Set<Int>, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        drawRoiOverlay(roi, mask, showGrid = false, borderWidthPx = 3.dp.toPx())
     }
 }
 
 /**
- * Editor da janela de medição: arrastar pelo MEIO move; arrastar pelas
- * ALÇAS dos cantos redimensiona. Frações persistidas ao salvar.
+ * Ferramenta JANELA: arrastar pelo MEIO move; arrastar pelas ALÇAS dos
+ * cantos redimensiona.
  */
 @Composable
 private fun RoiEditor(
     roi: RoiFractions,
+    mask: Set<Int>,
     onChange: (RoiFractions) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -616,14 +728,9 @@ private fun RoiEditor(
         val w = maxWidth
         val h = maxHeight
 
-        Box(
-            modifier = Modifier
-                .padding(start = w * roi.left, top = h * roi.top)
-                .width(w * roi.width())
-                .height(h * roi.height())
-                .background(Color.Yellow.copy(alpha = 0.12f), RoundedCornerShape(8.dp))
-                .border(4.dp, Color.Yellow, RoundedCornerShape(8.dp)),
-        )
+        Canvas(Modifier.fillMaxSize()) {
+            drawRoiOverlay(roi, mask, showGrid = false, borderWidthPx = 4.dp.toPx())
+        }
 
         // Alças dos cantos
         listOf(
@@ -643,15 +750,94 @@ private fun RoiEditor(
     }
 }
 
+/**
+ * Ferramenta MÁSCARA: toque alterna uma célula; arrastar "pinta" várias.
+ * Células vermelhas são IGNORADAS pela presença e neutralizadas no
+ * recorte enviado ao modelo (reflexos, partes móveis, respingos).
+ */
+@Composable
+private fun MaskEditor(
+    roi: RoiFractions,
+    mask: Set<Int>,
+    onChange: (Set<Int>) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val currentRoi by rememberUpdatedState(roi)
+    val currentMask by rememberUpdatedState(mask)
+    val onChangeState by rememberUpdatedState(onChange)
+
+    fun cellAt(pos: Offset, width: Int, height: Int): Int? {
+        val r = currentRoi
+        val grid = CellMask.GRID
+        val left = r.left * width
+        val top = r.top * height
+        val w = r.width() * width
+        val h = r.height() * height
+        if (pos.x < left || pos.x >= left + w || pos.y < top || pos.y >= top + h) return null
+        val gx = ((pos.x - left) / w * grid).toInt().coerceIn(0, grid - 1)
+        val gy = ((pos.y - top) / h * grid).toInt().coerceIn(0, grid - 1)
+        return gy * grid + gx
+    }
+
+    Box(
+        modifier = modifier
+            .pointerInput(Unit) {
+                detectTapGestures { pos ->
+                    cellAt(pos, size.width, size.height)?.let { idx ->
+                        onChangeState(
+                            if (idx in currentMask) currentMask - idx else currentMask + idx
+                        )
+                    }
+                }
+            }
+            .pointerInput(Unit) {
+                var paintAdd = true
+                detectDragGestures(
+                    onDragStart = { pos ->
+                        cellAt(pos, size.width, size.height)?.let { idx ->
+                            paintAdd = idx !in currentMask
+                            onChangeState(
+                                if (paintAdd) currentMask + idx else currentMask - idx
+                            )
+                        }
+                    },
+                    onDrag = { change, _ ->
+                        change.consume()
+                        cellAt(change.position, size.width, size.height)?.let { idx ->
+                            onChangeState(
+                                if (paintAdd) currentMask + idx else currentMask - idx
+                            )
+                        }
+                    },
+                )
+            },
+    ) {
+        Canvas(Modifier.fillMaxSize()) {
+            drawRoiOverlay(roi, mask, showGrid = true, borderWidthPx = 4.dp.toPx())
+        }
+    }
+}
+
 @Composable
 private fun RoiSetupControls(
+    tool: SetupTool,
+    onTool: (SetupTool) -> Unit,
+    zoom: Float,
+    maxZoom: Float,
+    onZoom: (Float) -> Unit,
+    maskedCount: Int,
+    onClearMask: () -> Unit,
     onSave: () -> Unit,
     onCancel: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(modifier = modifier, horizontalAlignment = Alignment.CenterHorizontally) {
         Text(
-            text = "Arraste o meio para mover · arraste os cantos para redimensionar",
+            text = when (tool) {
+                SetupTool.JANELA -> "Arraste o meio para mover · cantos para redimensionar"
+                SetupTool.MASCARA -> "Toque/arraste para pintar células a IGNORAR (vermelho)"
+                SetupTool.ZOOM -> "Aproxime a região da codificação sem mover o suporte"
+            },
             color = Color.White,
             fontSize = 16.sp,
             fontWeight = FontWeight.Bold,
@@ -659,14 +845,61 @@ private fun RoiSetupControls(
         Text(
             text = "Salvar exigirá NOVO treino de fundo e padrão",
             color = Color.Yellow,
-            fontSize = 14.sp,
+            fontSize = 13.sp,
         )
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.height(8.dp))
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            SetupTool.entries.forEach { t ->
+                Button(
+                    onClick = { onTool(t) },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (t == tool) BlueCalib else Color(0xFF37474F),
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.padding(horizontal = 4.dp),
+                ) {
+                    Text(
+                        text = when (t) {
+                            SetupTool.JANELA -> "JANELA"
+                            SetupTool.MASCARA -> "MÁSCARA ($maskedCount)"
+                            SetupTool.ZOOM -> "ZOOM %.1fx".format(Locale.US, zoom)
+                        },
+                        fontWeight = FontWeight.Black,
+                    )
+                }
+            }
+        }
+
+        when (tool) {
+            SetupTool.ZOOM -> {
+                if (maxZoom > 1f) {
+                    Slider(
+                        value = zoom,
+                        onValueChange = onZoom,
+                        valueRange = 1f..maxZoom,
+                        modifier = Modifier.fillMaxWidth(0.6f),
+                    )
+                } else {
+                    Text("Zoom não suportado pela câmera", color = Color.LightGray, fontSize = 13.sp)
+                }
+            }
+            SetupTool.MASCARA -> {
+                if (maskedCount > 0) {
+                    TextButton(onClick = onClearMask) {
+                        Text("Limpar máscara", color = Color.Yellow, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+            SetupTool.JANELA -> Unit
+        }
+
+        Spacer(Modifier.height(6.dp))
         Row {
             Button(
                 onClick = onSave,
                 colors = ButtonDefaults.buttonColors(containerColor = GreenOk),
-            ) { Text("SALVAR ROI", fontWeight = FontWeight.Black) }
+            ) { Text("SALVAR AJUSTE", fontWeight = FontWeight.Black) }
             Spacer(Modifier.width(16.dp))
             Button(
                 onClick = onCancel,

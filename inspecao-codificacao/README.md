@@ -75,10 +75,16 @@ Código: `domain/AppState.kt`, orquestração em `InspectionViewModel.kt`.
 
 ## Ajustes de campo (QA Admin: toque longo no título)
 
-- **Ajustar janela de medição (ROI)**: arraste o meio para mover, os cantos
-  para redimensionar; persistida em DataStore. O preview agora é 4:3 com
-  escala FIT — a moldura na tela corresponde 1:1 ao recorte analisado
-  (corrige o desalinhamento que mascarava a ROI real em campo).
+- **Ajustar janela de medição** com TRÊS ferramentas (salvas juntas;
+  alterar qualquer uma exige retreino):
+  - **JANELA**: arraste o meio para mover, os cantos para redimensionar;
+  - **MÁSCARA**: pinte células (grade 16×16) a IGNORAR dentro da janela —
+    reflexos, partes móveis da máquina, respingos. Excluídas da presença e
+    neutralizadas (cinza) no recorte enviado ao modelo;
+  - **ZOOM**: slider 1x..máx da câmera para aproximar a região da
+    codificação sem mover o suporte físico; persistido e reaplicado no boot.
+  O preview é 4:3 com escala FIT — a moldura corresponde 1:1 ao recorte
+  analisado.
 - **Sensibilidade de presença** (0,25x–4x): multiplicador sobre os thresholds
   auto-calibrados, aplicado SEM retreinar — corrige contagem zerada em campo.
 - **Diagnóstico na tela** (ligado por padrão): presença e anomalia ao vivo
@@ -130,14 +136,21 @@ em um item — garanta o espaçamento do transportador no ponto da câmera.
 
 ## Matemática dos scores
 
-**Estágio 1 — presença** (`camera/LumaGrid.kt`):
+**Estágio 1 — presença v2: fração de células alteradas**
+(`ml/InspectionModel.kt`):
 
 ```
-presença(frame) = média(|luma_célula − luma_fundo_célula|) / 255
+desvio_i = luma_i − fundo_i                     (grade 16×16, blocos 4×4)
+shift    = mediana(desvios)                     (compensa deriva de iluminação)
+mudou_i  = |desvio_i − shift| > max(6·σ_i, 8)   (ruído POR CÉLULA, do treino)
+presença = células que mudaram / células ativas (máscara excluída)
 ```
 
-Grade 16×16 de luminância da ROI comparada à referência aprendida com a
-esteira vazia. Sobe bruscamente quando a garrafa entra (Estado B).
+Robusta à fração da ROI ocupada: garrafa cobrindo 20% das células ⇒
+presença ≈ 20%, independente da intensidade — a média global da v1 diluía
+o sinal quando a janela era maior que a garrafa e zerava a contagem.
+Thresholds interpretáveis: entrar ≈ 12% das células, sair ≈ 6% (auto-
+calibrados pelo ruído do fundo, com pisos).
 
 **Estágio 2 — anomalia** (`ml/InspectionModel.kt`): embedding `f`
 (MobileNetV3-Small, Global Average Pooling, L2-normalizado) contra o
@@ -146,6 +159,11 @@ centroide do produto bom:
 ```
 anomalia(f) = 1 − (f · μ_produto) / ‖μ_produto‖        (‖f‖ = 1)
 ```
+
+**Gate de centralização**: o treino aprende o percentil 60 das presenças
+amostradas e só usa (no treino E na inferência) frames acima dele —
+garrafas meio dentro/meio fora inflavam o desvio do treino e tornavam o
+threshold `μ+4σ` inalcançável (defeitos nunca disparavam).
 
 **Threshold automático** ("k-sigma", `ml/CalibrationSession.kt`): ao final
 da calibração, cada embedding de produto é pontuado contra `μ_produto`:
